@@ -166,10 +166,30 @@ backup_volume() {
 
     if [[ $? -eq 0 ]]; then
         log "Successfully backed up volume '$volume_name' to '$backup_path'"
+
+        # --- Verification Step ---
+        log "Verifying backup file: $backup_path"
+        if gzip -t "$backup_path"; then # -t tests integrity
+             log "Backup file '$backup_path' integrity verified."
+             # Optional deeper check: List contents (can be slow for large archives)
+             # if tar -tzf "$backup_path" > /dev/null; then
+             #     log "Backup file '$backup_path' contents listing successful."
+             # else
+             #     log "ERROR: Verification failed (tar listing) for backup file '$backup_path'. It might be corrupted."
+             #     rm -f "$backup_path"
+             #     return 1
+             # fi
+        else
+            log "ERROR: Verification failed (gzip integrity) for backup file '$backup_path'. It might be corrupted."
+            rm -f "$backup_path" # Remove corrupted file
+            return 1 # Indicate failure
+        fi
+        # --- End Verification ---
+
     else
         log "ERROR: Failed to back up volume '$volume_name'."
         # Clean up potentially incomplete backup file
-        rm -f "$backup_path"
+        rm -f "$backup_path" # Already attempted in the error block
         return 1 # Indicate failure
     fi
     return 0 # Indicate success
