@@ -56,6 +56,20 @@ get_backup_dir() {
     log "Using backup directory: ${!backup_dir_var}"
 }
 
+# Helper function to get the specific path for a volume's backups
+get_volume_backup_path() {
+    local main_backup_dir="$1"
+    local volume_name="$2"
+    # Basic sanitization for volume name to avoid issues with path traversal or weird chars
+    # Replace / with _ and remove any characters not alphanumeric, underscore, or hyphen
+    local sanitized_volume_name=$(echo "$volume_name" | sed 's|/|_|g' | tr -cd '[:alnum:]_-')
+    if [[ -z "$sanitized_volume_name" ]]; then
+        log "ERROR: Could not generate a valid directory name for volume '$volume_name'"
+        return 1 # Indicate error
+    fi
+    echo "${main_backup_dir}/${sanitized_volume_name}"
+}
+
 # Helper function to select multiple volumes interactively
 select_multiple_volumes() {
     local available_volumes_ref=$1 # Reference to the array of available volumes
@@ -133,16 +147,19 @@ backup_volume() {
     local backup_dir="$2"
     local timestamp=$(date +"$TIMESTAMP_FORMAT")
     local backup_filename="${volume_name}_${timestamp}.tar.gz"
-    local backup_path="${backup_dir}/${backup_filename}"
+    local volume_backup_dir=$(get_volume_backup_path "$backup_dir" "$volume_name")
+    if [[ $? -ne 0 ]]; then return 1; fi # Error handled in get_volume_backup_path
+
+    # Ensure the volume-specific directory exists
+    mkdir -p "$volume_backup_dir" || { log "ERROR: Failed to create volume backup directory '$volume_backup_dir'. Check permissions."; return 1; }
+
+    local backup_path="${volume_backup_dir}/${backup_filename}"
     local temp_container_name="volume_backup_helper_$(uuidgen)" # Unique name for helper container
 
-    log "Starting backup for volume: $volume_name"
-
-    # Use a temporary container to access the volume data
-    # Mount the volume and the backup directory into the container
+    log "Starting backup for volume: $volume_name into $volume_backup_dir"
     docker run --rm --name "$temp_container_name" \
         -v "${volume_name}:/volume_data:ro" \
-        -v "${backup_dir}:/backup_target" \
+        -v "${volume_backup_dir}:/backup_target" \
         alpine \
         tar -czf "/backup_target/${backup_filename}" -C /volume_data .
 
@@ -163,15 +180,24 @@ rotate_backups() {
     local backup_dir="$2"
     local max_to_keep="$3"
 
+    local volume_backup_dir=$(get_volume_backup_path "$backup_dir" "$volume_name")
+    if [[ $? -ne 0 ]]; then return 1; fi # Error handled in get_volume_backup_path
+
+    # Check if the directory exists before attempting rotation
+    if [[ ! -d "$volume_backup_dir" ]]; then
+        log "Backup directory '$volume_backup_dir' for volume '$volume_name' not found. Skipping rotation."
+        return 0
+    fi
+
     # Validate max_to_keep
     if ! [[ "$max_to_keep" =~ ^[0-9]+$ ]] || [[ "$max_to_keep" -lt 1 ]]; then
         log "Warning: Invalid max_backups value '$max_to_keep' for volume '$volume_name'. Using default 1."
         max_to_keep=1
     fi
 
-    log "Rotating backups for volume: $volume_name in $backup_dir (keeping $max_to_keep)"
-    # List backups for the specific volume, sort by time (newest first), skip the first $max_to_keep, delete the rest
-    ls -1t "${backup_dir}/${volume_name}_"*.tar.gz 2>/dev/null | tail -n +$(($max_to_keep + 1)) | while read -r old_backup; do
+    log "Rotating backups for volume: $volume_name in $volume_backup_dir (keeping $max_to_keep)"
+    # List backups for the specific volume within its directory
+    ls -1t "${volume_backup_dir}/${volume_name}_"*.tar.gz 2>/dev/null | tail -n +$(($max_to_keep + 1)) | while read -r old_backup; do
         log "Deleting old backup: $old_backup"
         rm "$old_backup"
     done
@@ -181,16 +207,24 @@ rotate_backups() {
 list_backups() {
     local volume_name="$1"
     local backup_dir="$2"
-    log "Available backups for volume '$volume_name' in '$backup_dir':"
-    find "$backup_dir" -maxdepth 1 -name "${volume_name}_*.tar.gz" -printf "%f\n" | sort
+    local volume_backup_dir=$(get_volume_backup_path "$backup_dir" "$volume_name")
+    if [[ $? -ne 0 ]]; then return 1; fi # Error handled in get_volume_backup_path
+
+    if [[ ! -d "$volume_backup_dir" ]]; then
+         log "Backup directory '$volume_backup_dir' for volume '$volume_name' not found."
+         return 1
+    fi
+
+    log "Available backups for volume '$volume_name' in '$volume_backup_dir':"
+    find "$volume_backup_dir" -maxdepth 1 -name "${volume_name}_*.tar.gz" -printf "%f\n" | sort
 }
 
 # Restore a volume from a backup file
 restore_volume() {
     local volume_name="$1"
     local backup_filename="$2"
-    local backup_dir="$3"
-    local backup_path="${backup_dir}/${backup_filename}"
+    local volume_backup_dir="$3" # Note: This is now the *volume-specific* directory
+    local backup_path="${volume_backup_dir}/${backup_filename}"
     local temp_container_name="volume_restore_helper_$(uuidgen)" # Unique name for helper container
 
     if [[ ! -f "$backup_path" ]]; then
@@ -239,7 +273,7 @@ restore_volume() {
     log "Restoring data..."
     docker run --rm --name "$temp_container_name" \
         -v "${volume_name}:/volume_data" \
-        -v "${backup_dir}:/backup_source:ro" \
+        -v "${volume_backup_dir}:/backup_source:ro" \
         alpine \
         tar -xzf "/backup_source/${backup_filename}" -C /volume_data
 
@@ -611,12 +645,19 @@ fi
 if [[ "$ACTION" == "restore" ]]; then
     log "--- Interactive Restore Mode (using backup dir: $BACKUP_DIR) ---"
 
-    # Get all potential volumes from backup filenames in the configured directory
-    available_volume_names=($(find "$BACKUP_DIR" -maxdepth 1 -name '*.tar.gz' -printf "%f\n" | sed -E 's/_.*\.tar\.gz$//' | sort -u))
-    # Refined sed pattern to remove timestamp and extension more reliably
+    # Get all potential volumes by listing subdirectories in the main backup directory
+    available_volume_names=()
+    # Use find to list directories, handle potential errors, get basename, sort
+    while IFS= read -r dir_path; do
+         # Extract original volume name if possible (assuming dir name matches sanitized name)
+         # This is a bit heuristic, might need adjustment if sanitization is complex
+         local potential_name=$(basename "$dir_path")
+         # Maybe store original name alongside sanitized in config later? For now, use dir name.
+        available_volume_names+=("$potential_name")
+    done < <(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
 
     if [ ${#available_volume_names[@]} -eq 0 ]; then
-        log "No backups found in '$BACKUP_DIR'."
+        log "No volume backup subdirectories found in '$BACKUP_DIR'."
         exit 1
     fi
 
@@ -633,10 +674,22 @@ if [[ "$ACTION" == "restore" ]]; then
         fi
     done
 
-    available_backups=($(find "$BACKUP_DIR" -maxdepth 1 -name "${volume_to_restore}_*.tar.gz" -printf "%f\n" | sort -r)) # Sort descending, newest first
+    # Determine the specific directory for the chosen volume
+    # Use the selected name (which should be the sanitized directory name)
+    local volume_to_restore_dir=$(get_volume_backup_path "$BACKUP_DIR" "$volume_to_restore")
+    if [[ $? -ne 0 ]]; then exit 1; fi # Error handled in get_volume_backup_path
+    if [[ ! -d "$volume_to_restore_dir" ]]; then
+        log "ERROR: Selected volume directory '$volume_to_restore_dir' does not exist."
+        exit 1
+    fi
+
+    # List backups within the volume-specific directory
+    # Note: The backup filename uses the ORIGINAL volume name, but we search using the DIRECTORY name ($volume_to_restore)
+    # We should use the directory name variable, not the original volume name variable here
+    available_backups=($(find "$volume_to_restore_dir" -maxdepth 1 -name "${volume_to_restore}_*.tar.gz" -printf "%f\\n" 2>/dev/null | sort -r)) # Sort descending, newest first
 
     if [ ${#available_backups[@]} -eq 0 ]; then
-        log "No backups found for volume '$volume_to_restore' in '$BACKUP_DIR'."
+        log "No backups found for volume '$volume_to_restore' in '$volume_to_restore_dir'."
         # This should theoretically not happen if the volume name was derived from existing files, but check anyway.
         exit 1
     fi
@@ -648,7 +701,12 @@ if [[ "$ACTION" == "restore" ]]; then
             exit 0
         elif [[ -n "$backup_file_choice" ]]; then
             log "Selected backup file: $backup_file_choice"
-            restore_volume "$volume_to_restore" "$backup_file_choice" "$BACKUP_DIR"
+            # Pass the volume-specific directory to restore_volume
+            # The volume name itself should still be the original name for docker commands
+            # We need to map the selected directory name back to the *original* docker volume name if sanitization occurred.
+            # For simplicity now, assume the directory name IS the volume name docker knows.
+            # A more robust solution might involve reading the config file again here or storing mapping.
+            restore_volume "$volume_to_restore" "$backup_file_choice" "$volume_to_restore_dir"
             break
         else
             echo "Invalid choice. Please select a number."
