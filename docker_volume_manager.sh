@@ -618,7 +618,7 @@ if [[ "$ACTION" == "backup" ]]; then
                 continue
             fi
 
-            local max_backups=${CONFIG_VOLUMES[$vol]} # Already resolved during load_config
+            max_backups=${CONFIG_VOLUMES[$vol]} # Already resolved during load_config
             log "Processing backup for configured volume: $vol (max_backups: $max_backups)"
             backup_volume "$vol" "$BACKUP_DIR"
             if [[ $? -ne 0 ]]; then
