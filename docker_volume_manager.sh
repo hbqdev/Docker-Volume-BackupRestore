@@ -154,7 +154,8 @@ backup_volume() {
     mkdir -p "$volume_backup_dir" || { log "ERROR: Failed to create volume backup directory '$volume_backup_dir'. Check permissions."; return 1; }
 
     local backup_path="${volume_backup_dir}/${backup_filename}"
-    local temp_container_name="volume_backup_helper_$(uuidgen)" # Unique name for helper container
+    # Use date + random instead of uuidgen for portability
+    local temp_container_name="volume_backup_helper_$(date +%s%N)_$RANDOM"
 
     log "Starting backup for volume: $volume_name into $volume_backup_dir"
     docker run --rm --name "$temp_container_name" \
@@ -225,7 +226,8 @@ restore_volume() {
     local backup_filename="$2"
     local volume_backup_dir="$3" # Note: This is now the *volume-specific* directory
     local backup_path="${volume_backup_dir}/${backup_filename}"
-    local temp_container_name="volume_restore_helper_$(uuidgen)" # Unique name for helper container
+    # Use date + random instead of uuidgen for portability
+    local temp_container_name="volume_restore_helper_$(date +%s%N)_$RANDOM"
 
     if [[ ! -f "$backup_path" ]]; then
         log "ERROR: Backup file '$backup_path' not found."
